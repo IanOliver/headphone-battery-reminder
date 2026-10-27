@@ -13,7 +13,7 @@ charged, and cancels the day's reminders.
 
 When the battery drops into the amber or red level, a sound is played and the
 level is spoken (using Piper, set up by install.sh), with any playing media
-paused around them.
+paused around them. If no music is playing then, this waits until it is.
 """
 
 import argparse
@@ -38,12 +38,12 @@ except (ValueError, ImportError):
     AppIndicator = None
 
 APP_ID = "headphone-battery-reminder"
-DEFAULT_DEVICE = "AC:80:0A:6D:F3:4E"  # WH-1000XM4
 DEFAULT_THRESHOLD = 50
 DEFAULT_NOTIFY_AT = "17:25"
 DEFAULT_BREAK_MINUTES = 2
 POLL_SECONDS = 30
 ICON = "audio-headphones-symbolic"
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID / "config"  # written by install.sh
 STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP_ID / "state.json"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID
 ICON_DIR = CACHE_DIR / "icons"
@@ -200,13 +200,20 @@ class Reminder:
             self.name, self.connected, percentage, playing = info
             if self.connected and percentage is not None:
                 self.percentage = percentage
+                level = battery_level(percentage)
                 previous = self.state.get("last_percentage")
                 if previous != percentage:
-                    level = battery_level(percentage)
-                    sound = ALERT_SOUNDS.get(BATTERY_COLOURS[level][1])
-                    if previous is not None and level > battery_level(previous) and sound:
-                        self._alert(sound, f"Headphones at {percentage} percent.")
+                    if previous is not None and level > battery_level(previous) and BATTERY_COLOURS[level][1] in ALERT_SOUNDS:
+                        self.state["pending_alert"] = level
                     self.state["last_percentage"] = percentage
+                    self._save_state()
+
+                # Alerts wait until music is playing, so they're heard, and use the latest level.
+                pending = self.state.get("pending_alert")
+                if pending is not None and (level < pending or self._media_playing()):
+                    if level >= pending:
+                        self._alert(ALERT_SOUNDS[BATTERY_COLOURS[level][1]], f"Headphones at {percentage} percent.")
+                    del self.state["pending_alert"]  # played, or charged since
                     self._save_state()
                 if percentage < self.threshold:
                     if self.state.get("low_date") != today or percentage < self.state.get("low_percentage", 101):
@@ -301,19 +308,20 @@ class Reminder:
             print(f"Piper not found at {PIPER_PYTHON}; run install.sh. Playing the sound only.", file=sys.stderr)
             start()
 
-    def _pause_players(self):
-        """Pause every MPRIS media player that is playing, returning their bus names."""
-        paused = []
+    def _playing_players(self):
+        """Bus names of the MPRIS media players that are playing."""
         try:
             names = self.session_bus.list_names()
         except dbus.DBusException:
-            return paused
-        for name in names:
-            if not name.startswith("org.mpris.MediaPlayer2."):
-                continue
-            if self._player_status(name) == "Playing" and self._call_player(name, "Pause"):
-                paused.append(name)
-        return paused
+            return []
+        return [n for n in names if n.startswith("org.mpris.MediaPlayer2.") and self._player_status(n) == "Playing"]
+
+    def _media_playing(self):
+        return bool(self._playing_players())
+
+    def _pause_players(self):
+        """Pause every MPRIS media player that is playing, returning their bus names."""
+        return [name for name in self._playing_players() if self._call_player(name, "Pause")]
 
     def _player_status(self, name):
         try:
@@ -390,11 +398,32 @@ class Reminder:
         self.reminder_item.set_label(reminder)
 
 
+def read_config():
+    """Settings from the config file written by install.sh, as {key: value}."""
+    config = {}
+    try:
+        lines = CONFIG_FILE.read_text().splitlines()
+    except OSError:
+        return config
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and not key.strip().startswith("#"):
+            config[key.strip()] = value.strip()
+    return config
+
+
 def main():
+    config = read_config()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Bluetooth MAC address (default: %(default)s)")
+    parser.add_argument(
+        "--device", default=config.get("device"), help=f"Bluetooth MAC address (default: from {CONFIG_FILE})"
+    )
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD, help="remind below this %% (default: %(default)s)")
-    parser.add_argument("--at", default=DEFAULT_NOTIFY_AT, help="time of day to remind, HH:MM (default: %(default)s)")
+    parser.add_argument(
+        "--at",
+        default=config.get("remind_at", DEFAULT_NOTIFY_AT),
+        help=f"time of day to remind, HH:MM (default: from {CONFIG_FILE}, or {DEFAULT_NOTIFY_AT})",
+    )
     parser.add_argument(
         "--break-after",
         type=int,
@@ -403,7 +432,12 @@ def main():
     )
     args = parser.parse_args()
 
-    notify_at = dt.datetime.strptime(args.at, "%H:%M").time()
+    if not args.device:
+        parser.error("no headphones chosen: run install.sh, or pass --device")
+    try:
+        notify_at = dt.datetime.strptime(args.at, "%H:%M").time()
+    except ValueError:
+        parser.error(f"reminder time {args.at!r} isn't in HH:MM format")
     DBusGMainLoop(set_as_default=True)
     Reminder(args.device.upper(), args.threshold, notify_at, dt.timedelta(minutes=args.break_after))
     Gtk.main()
