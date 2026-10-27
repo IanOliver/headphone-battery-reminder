@@ -35,6 +35,37 @@ DEFAULT_NOTIFY_AT = "17:25"
 POLL_SECONDS = 30
 ICON = "audio-headphones-symbolic"
 STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP_ID / "state.json"
+ICON_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID / "icons"
+
+# Tray icon colour by battery level: (minimum percentage, icon name, colour).
+BATTERY_COLOURS = [
+    (75, f"{APP_ID}-white", "#ffffff"),
+    (50, f"{APP_ID}-green", "#33d17a"),
+    (30, f"{APP_ID}-amber", "#ffa000"),
+    (0, f"{APP_ID}-red", "#e01b24"),
+]
+DISCONNECTED_ICON = f"{APP_ID}-disconnected"
+DISCONNECTED_COLOUR = "#8a8a8a"
+HEADPHONES_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path d="M2.75 10V8a5.25 5.25 0 0 1 10.5 0v2" fill="none" stroke="{colour}" stroke-width="1.5" stroke-linecap="round"/>
+  <rect x="1.5" y="9" width="3.5" height="5.5" rx="1.2" fill="{colour}"/>
+  <rect x="11" y="9" width="3.5" height="5.5" rx="1.2" fill="{colour}"/>
+</svg>
+"""
+# The headphones with a gap cut out around a diagonal slash, so it reads on any panel colour.
+DISCONNECTED_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <mask id="gap">
+    <rect width="16" height="16" fill="white"/>
+    <path d="M1.5 1.5L14.5 14.5" stroke="black" stroke-width="3.5" stroke-linecap="round"/>
+  </mask>
+  <g mask="url(#gap)">
+    <path d="M2.75 10V8a5.25 5.25 0 0 1 10.5 0v2" fill="none" stroke="{colour}" stroke-width="1.5" stroke-linecap="round"/>
+    <rect x="1.5" y="9" width="3.5" height="5.5" rx="1.2" fill="{colour}"/>
+    <rect x="11" y="9" width="3.5" height="5.5" rx="1.2" fill="{colour}"/>
+  </g>
+  <path d="M1.5 1.5L14.5 14.5" stroke="{colour}" stroke-width="1.5" stroke-linecap="round"/>
+</svg>
+"""
 
 
 def read_battery(bus, address):
@@ -138,7 +169,14 @@ class Reminder:
     # --- tray ----------------------------------------------------------------
 
     def _build_indicator(self):
-        indicator = AppIndicator.Indicator.new(APP_ID, ICON, AppIndicator.IndicatorCategory.HARDWARE)
+        ICON_DIR.mkdir(parents=True, exist_ok=True)
+        for _, name, colour in BATTERY_COLOURS:
+            (ICON_DIR / f"{name}.svg").write_text(HEADPHONES_SVG.format(colour=colour))
+        (ICON_DIR / f"{DISCONNECTED_ICON}.svg").write_text(DISCONNECTED_SVG.format(colour=DISCONNECTED_COLOUR))
+
+        indicator = AppIndicator.Indicator.new(APP_ID, DISCONNECTED_ICON, AppIndicator.IndicatorCategory.HARDWARE)
+        indicator.set_icon_theme_path(str(ICON_DIR))
+        self.icon_name = DISCONNECTED_ICON
         indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         indicator.set_title("Headphone Battery Reminder")
 
@@ -167,6 +205,14 @@ class Reminder:
         else:
             status = f"{self.name}: not connected"
         self.status_item.set_label(status)
+
+        # Coloured by level while connected; grey and struck through otherwise.
+        icon_name = DISCONNECTED_ICON
+        if self.connected and self.percentage is not None:
+            icon_name = next(name for minimum, name, _ in BATTERY_COLOURS if self.percentage >= minimum)
+        if icon_name != self.icon_name:
+            self.icon_name = icon_name
+            self.indicator.set_icon_full(icon_name, status)
 
         if self._pending_today():
             reminder = f"Reminder pending for {self.notify_at:%H:%M}"
