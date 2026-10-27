@@ -11,8 +11,9 @@ e.g. pausing music or taking the headphones off) gives an earlier reminder,
 at most once a day. A later reading back above the threshold means they were
 charged, and cancels the day's reminders.
 
-When the battery drops into the amber or red level, a sound is played, with
-any playing media paused around it.
+When the battery drops into the amber or red level, a sound is played and the
+level is spoken (using Piper, set up by install.sh), with any playing media
+paused around them.
 """
 
 import argparse
@@ -44,7 +45,15 @@ DEFAULT_BREAK_MINUTES = 2
 POLL_SECONDS = 30
 ICON = "audio-headphones-symbolic"
 STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP_ID / "state.json"
-ICON_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID / "icons"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / APP_ID
+ICON_DIR = CACHE_DIR / "icons"
+SPEECH_FILE = CACHE_DIR / "speech.wav"
+
+# Piper text-to-speech, set up by install.sh.
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP_ID
+PIPER_PYTHON = DATA_DIR / "piper-venv/bin/python"
+VOICES_DIR = DATA_DIR / "voices"
+VOICE = "en_GB-alba-medium"
 
 # Tray icon colour by battery level: (minimum percentage, icon name, colour).
 BATTERY_COLOURS = [
@@ -55,10 +64,10 @@ BATTERY_COLOURS = [
 ]
 # Sounds played when the battery drops into these levels, keyed by icon name.
 ALERT_SOUNDS = {
-    f"{APP_ID}-amber": "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
-    f"{APP_ID}-red": "/usr/share/sounds/freedesktop/stereo/dialog-error.oga",
+    f"{APP_ID}-amber": "/usr/share/sounds/gnome/default/alarms/digitone.oga",
+    f"{APP_ID}-red": "/usr/share/sounds/gnome/default/alarms/sonar.oga",
 }
-PAUSE_SETTLE_MS = 500  # gap between pausing music and the alert sound, and after it before resuming
+PAUSE_SETTLE_MS = 500  # gap between pausing music and the alert, and after it before resuming
 DISCONNECTED_ICON = f"{APP_ID}-disconnected"
 DISCONNECTED_COLOUR = "#8a8a8a"
 HEADPHONES_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
@@ -86,6 +95,26 @@ DISCONNECTED_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height=
 def battery_level(percentage):
     """Index into BATTERY_COLOURS for a percentage; higher is lower battery."""
     return next(i for i, (minimum, _, _) in enumerate(BATTERY_COLOURS) if percentage >= minimum)
+
+
+def run_command(argv, callback):
+    """Run a command without blocking, then call callback(succeeded)."""
+    try:
+        process = Gio.Subprocess.new([str(arg) for arg in argv], Gio.SubprocessFlags.NONE)
+    except GLib.Error as e:
+        print(f"Could not run {argv[0]}: {e}", file=sys.stderr)
+        callback(False)
+        return
+
+    def finished(process, result):
+        try:
+            succeeded = process.wait_check_finish(result)
+        except GLib.Error as e:
+            print(f"{argv[0]} failed: {e}", file=sys.stderr)
+            succeeded = False
+        callback(succeeded)
+
+    process.wait_check_async(None, finished)
 
 
 def read_device(bus, address):
@@ -176,7 +205,7 @@ class Reminder:
                     level = battery_level(percentage)
                     sound = ALERT_SOUNDS.get(BATTERY_COLOURS[level][1])
                     if previous is not None and level > battery_level(previous) and sound:
-                        self._alert(sound)
+                        self._alert(sound, f"Headphones at {percentage} percent.")
                     self.state["last_percentage"] = percentage
                     self._save_state()
                 if percentage < self.threshold:
@@ -231,29 +260,46 @@ class Reminder:
 
     # --- alert sound ---------------------------------------------------------
 
-    def _alert(self, sound):
-        """Play a sound, pausing any playing media first and resuming it afterwards."""
-        paused = self._pause_players()
+    def _alert(self, sound, text):
+        """Play a sound then speak the text, pausing any playing media around them."""
+        commands = [["pw-play", sound]]
 
-        def resume():
-            # Some players (e.g. Strawberry) ignore Play while paused, so toggle
-            # instead, but only if still paused, in case you've changed it since.
-            for player in paused:
-                if self._player_status(player) == "Paused":
-                    self._call_player(player, "PlayPause")
-            return False
+        def start():
+            paused = self._pause_players()
+            settle = PAUSE_SETTLE_MS if paused else 0
 
-        def play():
-            try:
-                process = Gio.Subprocess.new(["pw-play", sound], Gio.SubprocessFlags.NONE)
-            except GLib.Error as e:
-                print(f"Could not play alert sound: {e}", file=sys.stderr)
-                resume()
+            def resume():
+                # Some players (e.g. Strawberry) ignore Play while paused, so toggle
+                # instead, but only if still paused, in case you've changed it since.
+                for player in paused:
+                    if self._player_status(player) == "Paused":
+                        self._call_player(player, "PlayPause")
                 return False
-            process.wait_async(None, lambda *_: GLib.timeout_add(PAUSE_SETTLE_MS if paused else 0, resume))
-            return False
 
-        GLib.timeout_add(PAUSE_SETTLE_MS if paused else 0, play)
+            def play(remaining):
+                if remaining:
+                    run_command(remaining[0], lambda _: play(remaining[1:]))
+                else:
+                    GLib.timeout_add(settle, resume)
+                return False
+
+            GLib.timeout_add(settle, play, commands)
+
+        def spoken(succeeded):
+            if succeeded:
+                commands.append(["pw-play", SPEECH_FILE])
+            start()
+
+        # Generate the speech first (it takes a few seconds), so the music isn't paused while waiting.
+        if PIPER_PYTHON.exists():
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            run_command(
+                [PIPER_PYTHON, "-I", "-m", "piper", "--data-dir", VOICES_DIR, "-m", VOICE, "-f", SPEECH_FILE, "--", text],
+                spoken,
+            )
+        else:
+            print(f"Piper not found at {PIPER_PYTHON}; run install.sh. Playing the sound only.", file=sys.stderr)
+            start()
 
     def _pause_players(self):
         """Pause every MPRIS media player that is playing, returning their bus names."""
